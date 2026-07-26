@@ -1,5 +1,5 @@
-// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(affine-loop-fusion))' -split-input-file | FileCheck %s
-// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(affine-loop-fusion{maximal}))' -split-input-file | FileCheck %s --check-prefix=MAXIMAL
+// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(affine-loop-fusion))' -split-input-file | FileCheck %s --check-prefixes=CHECK,COMMON
+// RUN: mlir-opt -allow-unregistered-dialect %s -pass-pipeline='builtin.module(func.func(affine-loop-fusion{maximal}))' -split-input-file | FileCheck %s --check-prefixes=MAXIMAL,COMMON
 
 // Part I of fusion tests in  mlir/test/Transforms/loop-fusion.mlir.
 // Part II of fusion tests in mlir/test/Transforms/loop-fusion-2.mlir
@@ -1294,5 +1294,152 @@ func.func @unknown_memref_def_op() {
 }
 func.func private @bar() -> memref<10xf32>
 
+// -----
+
+// A non-maximal slice must not omit loop-carried predecessors.
+// COMMON-LABEL: func.func @do_not_fuse_partial_recurrence
+// COMMON:         affine.for %[[I:.*]] = 1 to 16 {
+// COMMON-NEXT:      %[[PREV:.*]] = affine.load %[[TMP:.*]][%[[I]] - 1]
+// COMMON-NEXT:      %[[VALUE:.*]] = affine.load %{{.*}}[%[[I]]]
+// COMMON-NEXT:      %[[NEXT:.*]] = arith.addf %[[PREV]], %[[VALUE]]
+// COMMON-NEXT:      affine.store %[[NEXT]], %[[TMP]][%[[I]]]
+// COMMON-NEXT:    }
+// COMMON-NEXT:    affine.for %[[J:.*]] = 1 to 8 {
+// COMMON-NEXT:      %[[READ:.*]] = affine.load %[[TMP]][%[[J]] * 2]
+// COMMON-NEXT:      %[[DOUBLED:.*]] = arith.addf %[[READ]], %[[READ]]
+// COMMON-NEXT:      affine.store %[[DOUBLED]], %{{.*}}[%[[J]]]
+// COMMON-NEXT:    }
+func.func @do_not_fuse_partial_recurrence(
+    %in: memref<32xf64>, %out: memref<32xf64>) {
+  %tmp = memref.alloc() : memref<32xf64>
+  %seed = arith.constant 2.900000e+01 : f64
+  affine.store %seed, %tmp[0] : memref<32xf64>
+  affine.for %i = 1 to 16 {
+    %prev = affine.load %tmp[%i - 1] : memref<32xf64>
+    %value = affine.load %in[%i] : memref<32xf64>
+    %next = arith.addf %prev, %value : f64
+    affine.store %next, %tmp[%i] : memref<32xf64>
+  }
+  affine.for %j = 1 to 8 {
+    %value = affine.load %tmp[2 * %j] : memref<32xf64>
+    %doubled = arith.addf %value, %value : f64
+    affine.store %doubled, %out[%j] : memref<32xf64>
+  }
+  return
+}
+
+// -----
+
+// Equal total work does not make it safe to repeat one recurrence partition
+// while omitting another.
+// COMMON-LABEL: func.func @do_not_repeat_recurrence_partition
+// COMMON:         affine.for %[[I:.*]] = 0 to 2 {
+// COMMON-NEXT:      affine.for %[[K:.*]] = 0 to 2 {
+// COMMON-NEXT:        %[[PREV:.*]] = affine.load %[[STATE:.*]][%[[I]]]
+// COMMON-NEXT:        %[[NEXT:.*]] = arith.addf %[[PREV]], %{{.*}}
+// COMMON-NEXT:        affine.store %[[NEXT]], %[[STATE]][%[[I]]]
+// COMMON-NEXT:      }
+// COMMON:           affine.store %{{.*}}, %[[PRODUCED:.*]][%[[I]]]
+// COMMON-NEXT:    }
+// COMMON-NEXT:    affine.for %[[J:.*]] = 0 to 2 {
+// COMMON-NEXT:      %[[VALUE:.*]] = affine.load %[[PRODUCED]][0]
+// COMMON-NEXT:      affine.store %[[VALUE]], %{{.*}}[%[[J]]]
+// COMMON-NEXT:    }
+func.func @do_not_repeat_recurrence_partition(%out: memref<2xf64>) {
+  %state = memref.alloc() : memref<2xf64>
+  %produced = memref.alloc() : memref<2xf64>
+  %zero = arith.constant 0.000000e+00 : f64
+  %one = arith.constant 1.000000e+00 : f64
+  affine.store %zero, %state[0] : memref<2xf64>
+  affine.store %zero, %state[1] : memref<2xf64>
+  affine.for %i = 0 to 2 {
+    affine.for %k = 0 to 2 {
+      %previous = affine.load %state[%i] : memref<2xf64>
+      %next = arith.addf %previous, %one : f64
+      affine.store %next, %state[%i] : memref<2xf64>
+    }
+    %value = affine.load %state[%i] : memref<2xf64>
+    affine.store %value, %produced[%i] : memref<2xf64>
+  }
+  affine.for %j = 0 to 2 {
+    %value = affine.load %produced[0] : memref<2xf64>
+    affine.store %value, %out[%j] : memref<2xf64>
+  }
+  return
+}
+
+// -----
+
+// Even an identity partition may not interleave an SSA recurrence with a
+// consumer that overwrites an input needed by a later source partition.
+// COMMON-LABEL: func.func @do_not_interleave_ssa_recurrence
+// COMMON:         affine.for %[[I:.*]] = 0 to 4 {
+// COMMON-NEXT:      %[[SUM:.*]] = affine.for %[[K:.*]] = 0 to 4 iter_args(%[[ACC:.*]] = %{{.*}}) -> (f32) {
+// COMMON-NEXT:        %[[VALUE:.*]] = affine.load %[[IN:.*]][%[[K]]]
+// COMMON-NEXT:        %[[NEXT:.*]] = arith.addf %[[ACC]], %[[VALUE]]
+// COMMON-NEXT:        affine.yield %[[NEXT]]
+// COMMON-NEXT:      }
+// COMMON-NEXT:      affine.store %[[SUM]], %[[TMP:.*]][%[[I]]]
+// COMMON-NEXT:    }
+// COMMON-NEXT:    affine.for %[[J:.*]] = 0 to 4 {
+// COMMON-NEXT:      %[[RESULT:.*]] = affine.load %[[TMP]][%[[J]]]
+// COMMON-NEXT:      affine.store %[[RESULT]], %{{.*}}[%[[J]]]
+// COMMON-NEXT:      affine.store %{{.*}}, %[[IN]][%[[J]]]
+// COMMON-NEXT:    }
+func.func @do_not_interleave_ssa_recurrence(
+    %in: memref<4xf32>, %out: memref<4xf32>) {
+  %tmp = memref.alloc() : memref<4xf32>
+  %zero = arith.constant 0.0 : f32
+  affine.for %i = 0 to 4 {
+    %sum = affine.for %k = 0 to 4 iter_args(%acc = %zero) -> f32 {
+      %value = affine.load %in[%k] : memref<4xf32>
+      %next = arith.addf %acc, %value : f32
+      affine.yield %next : f32
+    }
+    affine.store %sum, %tmp[%i] : memref<4xf32>
+  }
+  affine.for %j = 0 to 4 {
+    %result = affine.load %tmp[%j] : memref<4xf32>
+    affine.store %result, %out[%j] : memref<4xf32>
+    affine.store %zero, %in[%j] : memref<4xf32>
+  }
+  return
+}
+
+// -----
+
+// Non-affine memory accesses are outside affine dependence analysis and must
+// be treated conservatively when they may carry flow across source iterations.
+// COMMON-LABEL: func.func @do_not_slice_nonaffine_recurrence
+// COMMON:         affine.for %[[I:.*]] = 1 to 8 {
+// COMMON-NEXT:      %[[PREV:.*]] = memref.load %[[STATE:.*]][]
+// COMMON-NEXT:      %[[VALUE:.*]] = affine.load %{{.*}}[%[[I]]]
+// COMMON-NEXT:      %[[NEXT:.*]] = arith.addf %[[PREV]], %[[VALUE]]
+// COMMON-NEXT:      memref.store %[[NEXT]], %[[STATE]][]
+// COMMON-NEXT:      affine.store %[[NEXT]], %[[PRODUCED:.*]][%[[I]]]
+// COMMON-NEXT:    }
+// COMMON-NEXT:    affine.for %[[J:.*]] = 1 to 4 {
+// COMMON-NEXT:      %[[RESULT:.*]] = affine.load %[[PRODUCED]][%[[J]] * 2]
+// COMMON-NEXT:      affine.store %[[RESULT]], %{{.*}}[%[[J]]]
+// COMMON-NEXT:    }
+func.func @do_not_slice_nonaffine_recurrence(
+    %in: memref<8xf32>, %out: memref<4xf32>) {
+  %state = memref.alloc() : memref<f32>
+  %produced = memref.alloc() : memref<8xf32>
+  %seed = arith.constant 0.0 : f32
+  memref.store %seed, %state[] : memref<f32>
+  affine.for %i = 1 to 8 {
+    %previous = memref.load %state[] : memref<f32>
+    %value = affine.load %in[%i] : memref<8xf32>
+    %next = arith.addf %previous, %value : f32
+    memref.store %next, %state[] : memref<f32>
+    affine.store %next, %produced[%i] : memref<8xf32>
+  }
+  affine.for %j = 1 to 4 {
+    %result = affine.load %produced[2 * %j] : memref<8xf32>
+    affine.store %result, %out[%j] : memref<4xf32>
+  }
+  return
+}
 
 // Add further tests in mlir/test/Transforms/loop-fusion-4.mlir

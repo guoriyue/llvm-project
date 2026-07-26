@@ -12,6 +12,7 @@
 
 #include "mlir/Dialect/Affine/Transforms/Passes.h"
 
+#include "mlir/Dialect/Affine/Analysis/AffineAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
 #include "mlir/Dialect/Affine/Analysis/LoopAnalysis.h"
 #include "mlir/Dialect/Affine/Analysis/Utils.h"
@@ -19,6 +20,7 @@
 #include "mlir/Dialect/Affine/LoopUtils.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/MemRef/Utils/MemRefUtils.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -65,6 +67,264 @@ struct LoopFusion : public affine::impl::AffineLoopFusionBase<LoopFusion> {
 };
 
 } // namespace
+
+/// Collect source dimensions that carry an SSA recurrence or affine flow
+/// dependence. Potential flow through non-affine accesses to the same
+/// underlying memref is treated conservatively because affine dependence
+/// analysis cannot model its iteration distance. Once a loop carries a
+/// dependence, nested dimensions are schedule-sensitive as well.
+static LogicalResult collectRecurrenceSensitiveIVs(
+    AffineForOp root, const MemRefDependenceGraph::Node &source,
+    llvm::SmallDenseSet<Value, 8> &sensitiveIVs) {
+  SmallVector<Operation *> accesses(source.loads.begin(), source.loads.end());
+  llvm::append_range(accesses, source.stores);
+
+  DenseSet<Operation *> locallyDefinedLoads;
+  for (Operation *loadOp : accesses) {
+    MemRefAccess loadAccess(loadOp);
+    if (loadAccess.isStore())
+      continue;
+    for (Operation *storeOp : accesses) {
+      MemRefAccess storeAccess(storeOp);
+      if (storeAccess.isStore() && storeOp->getBlock() == loadOp->getBlock() &&
+          storeOp->isBeforeInBlock(loadOp) && storeAccess == loadAccess) {
+        locallyDefinedLoads.insert(loadOp);
+        break;
+      }
+    }
+  }
+
+  auto markLoopAndDescendants = [&](AffineForOp loop) {
+    loop->walk([&](AffineForOp nested) {
+      sensitiveIVs.insert(nested.getInductionVar());
+    });
+  };
+
+  llvm::SmallDenseSet<Value, 8> readMemrefs;
+  llvm::SmallDenseSet<Value, 8> writtenMemrefs;
+  llvm::SmallDenseSet<Value, 8> nonAffineMemrefs;
+  auto getBaseMemref = [](Value memref) -> Value {
+    return memref::skipViewLikeOps(cast<MemrefValue>(memref));
+  };
+  for (Operation *op : source.loads)
+    readMemrefs.insert(
+        getBaseMemref(cast<AffineReadOpInterface>(op).getMemRef()));
+  for (Operation *op : source.stores)
+    writtenMemrefs.insert(
+        getBaseMemref(cast<AffineWriteOpInterface>(op).getMemRef()));
+
+  bool hasUnknownMemoryEffect = !source.memrefFrees.empty();
+  for (Operation *op : source.memrefLoads) {
+    if (auto load = dyn_cast<memref::LoadOp>(op)) {
+      Value memref = getBaseMemref(load.getMemRef());
+      readMemrefs.insert(memref);
+      nonAffineMemrefs.insert(memref);
+    } else {
+      hasUnknownMemoryEffect = true;
+    }
+  }
+  for (Operation *op : source.memrefStores) {
+    if (auto store = dyn_cast<memref::StoreOp>(op)) {
+      Value memref = getBaseMemref(store.getMemRef());
+      writtenMemrefs.insert(memref);
+      nonAffineMemrefs.insert(memref);
+    } else {
+      hasUnknownMemoryEffect = true;
+    }
+  }
+  if (hasUnknownMemoryEffect ||
+      llvm::any_of(nonAffineMemrefs, [&](Value memref) {
+        return readMemrefs.contains(memref) &&
+               writtenMemrefs.contains(memref);
+      }))
+    markLoopAndDescendants(root);
+
+  WalkResult result = root->walk([&](AffineForOp loop) {
+    if (loop.getNumIterOperands() != 0) {
+      markLoopAndDescendants(loop);
+      return WalkResult::advance();
+    }
+
+    unsigned depth = getNestingDepth(loop) + 1;
+    for (Operation *storeOp : accesses) {
+      MemRefAccess storeAccess(storeOp);
+      if (!storeAccess.isStore() || !loop->isProperAncestor(storeOp))
+        continue;
+      for (Operation *loadOp : accesses) {
+        MemRefAccess loadAccess(loadOp);
+        if (loadAccess.isStore() || !loop->isProperAncestor(loadOp) ||
+            locallyDefinedLoads.contains(loadOp) ||
+            storeAccess.memref != loadAccess.memref)
+          continue;
+
+        DependenceResult dependence =
+            checkMemrefAccessDependence(storeAccess, loadAccess, depth);
+        if (dependence.value == DependenceResult::Failure)
+          return WalkResult::interrupt();
+        if (hasDependence(dependence)) {
+          markLoopAndDescendants(loop);
+          return WalkResult::advance();
+        }
+      }
+    }
+    return WalkResult::advance();
+  });
+  return success(!result.wasInterrupted());
+}
+
+static bool preservesFullIterationSpace(const ComputationSliceState &slice,
+                                        unsigned index) {
+  AffineMap lbMap = slice.lbs[index];
+  AffineMap ubMap = slice.ubs[index];
+  if (!lbMap && !ubMap)
+    return true;
+  if (!lbMap || !ubMap || lbMap.getNumResults() != 1 ||
+      ubMap.getNumResults() != 1)
+    return false;
+
+  AffineForOp loop = getForInductionVarOwner(slice.ivs[index]);
+  auto lb = dyn_cast<AffineConstantExpr>(lbMap.getResult(0));
+  auto ub = dyn_cast<AffineConstantExpr>(ubMap.getResult(0));
+  return loop && loop.hasConstantBounds() && lb && ub &&
+         lb.getValue() == loop.getConstantLowerBound() &&
+         ub.getValue() == loop.getConstantUpperBound();
+}
+
+/// Match an identity unit slice controlled by a destination loop with the same
+/// constant bounds and step as the source loop.
+static Value getIdentitySliceControlIV(const ComputationSliceState &slice,
+                                       unsigned index) {
+  AffineMap lbMap = slice.lbs[index];
+  AffineMap ubMap = slice.ubs[index];
+  if (!lbMap || !ubMap || lbMap.getNumResults() != 1 ||
+      ubMap.getNumResults() != 1 ||
+      lbMap.getNumDims() != ubMap.getNumDims() ||
+      lbMap.getNumSymbols() != ubMap.getNumSymbols() ||
+      slice.lbOperands[index] != slice.ubOperands[index])
+    return {};
+
+  AffineExpr lbExpr = lbMap.getResult(0);
+  AffineExpr extent = simplifyAffineExpr(
+      ubMap.getResult(0) - lbExpr, lbMap.getNumDims(),
+      lbMap.getNumSymbols());
+  auto extentConstant = dyn_cast<AffineConstantExpr>(extent);
+  auto input = dyn_cast<AffineDimExpr>(lbExpr);
+  if (!extentConstant || extentConstant.getValue() != 1 || !input ||
+      input.getPosition() >= slice.lbOperands[index].size())
+    return {};
+
+  Value controlIV = slice.lbOperands[index][input.getPosition()];
+  AffineForOp srcLoop = getForInductionVarOwner(slice.ivs[index]);
+  AffineForOp dstLoop = getForInductionVarOwner(controlIV);
+  if (!srcLoop || !dstLoop || !srcLoop.hasConstantBounds() ||
+      !dstLoop.hasConstantBounds() ||
+      srcLoop.getConstantLowerBound() != dstLoop.getConstantLowerBound() ||
+      srcLoop.getConstantUpperBound() != dstLoop.getConstantUpperBound() ||
+      srcLoop.getStep() != dstLoop.getStep())
+    return {};
+  return controlIV;
+}
+
+static bool isAncestorOfAll(Value iv,
+                            const llvm::SmallDenseSet<Value, 8> &descendants) {
+  AffineForOp loop = getForInductionVarOwner(iv);
+  return loop && llvm::all_of(descendants, [&](Value descendant) {
+           AffineForOp descendantLoop = getForInductionVarOwner(descendant);
+           return descendantLoop &&
+                  (loop == descendantLoop ||
+                   loop->isProperAncestor(descendantLoop));
+         });
+}
+
+static bool preservesRecurrenceSchedule(
+    AffineForOp dstForOp,
+    const llvm::SmallDenseSet<Value, 8> &sensitiveIVs,
+    const ComputationSliceState &slice) {
+  if (sensitiveIVs.empty())
+    return true;
+
+  SmallVector<AffineForOp> invocationLoops;
+  Operation *parent = slice.insertPoint->getBlock()->getParentOp();
+  while (auto loop = dyn_cast_or_null<AffineForOp>(parent)) {
+    invocationLoops.push_back(loop);
+    if (loop == dstForOp)
+      break;
+    parent = loop->getParentOp();
+  }
+  if (invocationLoops.empty() || invocationLoops.back() != dstForOp)
+    return false;
+  std::reverse(invocationLoops.begin(), invocationLoops.end());
+
+  DenseMap<Value, unsigned> invocationOrder;
+  for (auto [index, loop] : llvm::enumerate(invocationLoops))
+    invocationOrder.try_emplace(loop.getInductionVar(), index);
+
+  llvm::SmallDenseSet<Value, 8> preservedSensitiveIVs;
+  llvm::SmallDenseSet<Value, 8> partitioningIVs;
+  std::optional<unsigned> previousPosition;
+  for (auto [index, iv] : llvm::enumerate(slice.ivs)) {
+    bool isSensitive = sensitiveIVs.contains(iv);
+    if (preservesFullIterationSpace(slice, index)) {
+      if (isSensitive)
+        preservedSensitiveIVs.insert(iv);
+      continue;
+    }
+
+    Value controlIV = getIdentitySliceControlIV(slice, index);
+    if (isSensitive || !controlIV || !isAncestorOfAll(iv, sensitiveIVs))
+      return false;
+    auto position = invocationOrder.find(controlIV);
+    if (position == invocationOrder.end() ||
+        (previousPosition && position->second <= *previousPosition))
+      return false;
+    partitioningIVs.insert(controlIV);
+    previousPosition = position->second;
+  }
+
+  if (preservedSensitiveIVs.size() != sensitiveIVs.size())
+    return false;
+
+  for (AffineForOp loop : invocationLoops) {
+    std::optional<APInt> tripCount = loop.getStaticTripCount();
+    if ((!tripCount || *tripCount != 1) &&
+        !partitioningIVs.contains(loop.getInductionVar()))
+      return false;
+  }
+  return true;
+}
+
+/// Return true when interleaving destination iterations with independent
+/// source partitions may reorder a source dependence.
+static bool mayInterleaveRecurrentSource(
+    unsigned srcId, unsigned dstId, const MemRefDependenceGraph &mdg,
+    const DenseSet<Value> &producerConsumerMemrefs) {
+  const MemRefDependenceGraph::Node *dstNode = mdg.getNode(dstId);
+  // Keep non-affine memory effects out of this affine-only proof.
+  if (!dstNode->memrefLoads.empty() || !dstNode->memrefStores.empty() ||
+      !dstNode->memrefFrees.empty())
+    return true;
+
+  for (const MemRefDependenceGraph::Edge &edge : mdg.outEdges.lookup(srcId)) {
+    if (edge.id == dstId && isa<MemRefType>(edge.value.getType()) &&
+        !producerConsumerMemrefs.contains(edge.value))
+      return true;
+  }
+
+  for (Value memref : producerConsumerMemrefs) {
+    SmallVector<Operation *> loads;
+    SmallVector<Operation *> stores;
+    dstNode->getLoadOpsForMemref(memref, &loads);
+    dstNode->getStoreOpsForMemref(memref, &stores);
+    for (Operation *store : stores) {
+      MemRefAccess storeAccess(store);
+      if (llvm::none_of(loads, [&](Operation *load) {
+            return storeAccess == MemRefAccess(load);
+          }))
+        return true;
+    }
+  }
+  return false;
+}
 
 /// Returns true if node 'srcId' can be removed after fusing it with node
 /// 'dstId'. The node can be removed if any of the following conditions are met:
@@ -990,12 +1250,28 @@ public:
         SmallVector<ComputationSliceState, 8> depthSliceUnions;
         depthSliceUnions.resize(dstLoopDepthTest);
         FusionStrategy strategy(FusionStrategy::ProducerConsumer);
+        llvm::SmallDenseSet<Value, 8> recurrenceSensitiveIVs;
+        if (failed(collectRecurrenceSensitiveIVs(
+                srcAffineForOp, *srcNode, recurrenceSensitiveIVs))) {
+          LDBG() << "Can't analyze source recurrences";
+          continue;
+        }
+        if (!recurrenceSensitiveIVs.empty() &&
+            mayInterleaveRecurrentSource(
+                srcId, dstId, *mdg, producerConsumerMemrefs)) {
+          LDBG() << "Can't fuse: destination may interleave a source "
+                    "dependence";
+          continue;
+        }
         for (unsigned i = 1; i <= dstLoopDepthTest; ++i) {
           FusionResult result =
               affine::canFuseLoops(srcAffineForOp, dstAffineForOp,
                                    /*dstLoopDepth=*/i + numSurroundingLoops,
                                    &depthSliceUnions[i - 1], strategy);
-          if (result.value == FusionResult::Success) {
+          if (result.value == FusionResult::Success &&
+              preservesRecurrenceSchedule(
+                  dstAffineForOp, recurrenceSensitiveIVs,
+                  depthSliceUnions[i - 1])) {
             maxLegalFusionDepth = i;
             LDBG() << "Found valid slice for depth: " << i;
           }
@@ -1010,13 +1286,14 @@ public:
 
         double computeToleranceThresholdToUse = computeToleranceThreshold;
 
-        // Cyclic dependences in the source nest may be violated when performing
-        // slicing-based fusion. They aren't actually violated in cases where no
-        // redundant execution of the source happens (1:1 pointwise dep on the
-        // producer-consumer memref access for example). Check this and allow
-        // fusion accordingly.
-        if (hasCyclicDependence(srcAffineForOp)) {
-          LDBG() << "Source nest has a cyclic dependence.";
+        // Slicing-sensitive dependences in the source nest may be violated by
+        // redundant execution. A 1:1 pointwise producer-consumer dependence
+        // does not add computation, so keep allowing that case.
+        bool srcHasSlicingSensitiveDependence =
+            hasCyclicDependence(srcAffineForOp) ||
+            !recurrenceSensitiveIVs.empty();
+        if (srcHasSlicingSensitiveDependence) {
+          LDBG() << "Source nest has a slicing-sensitive dependence.";
           // Maximal fusion does not check for compute tolerance threshold; so
           // perform the maximal fusion only when the redundanation computation
           // is zero.
@@ -1029,7 +1306,7 @@ public:
                 srcForOp, dstForOp, maxLegalFusionDepth, depthSliceUnions,
                 sliceCost, fusedLoopNestComputeCost);
             if (!fraction || fraction > 0) {
-              LDBG() << "Can't perform maximal fusion with a cyclic dependence "
+              LDBG() << "Can't perform maximal fusion with a source dependence "
                      << "and non-zero additional compute.";
               return;
             }
@@ -1037,7 +1314,7 @@ public:
             // Set redundant computation tolerance to zero regardless of what
             // the user specified. Without this, fusion would be invalid.
             LDBG() << "Setting compute tolerance to zero since "
-                   << "source has a cylic dependence.";
+                   << "source has a slicing-sensitive dependence.";
             computeToleranceThresholdToUse = 0;
           }
         }
@@ -1067,6 +1344,12 @@ public:
         ComputationSliceState &bestSlice =
             depthSliceUnions[bestDstLoopDepth - 1];
         assert(!bestSlice.isEmpty() && "Missing slice union for depth");
+        if (!preservesRecurrenceSchedule(
+                dstAffineForOp, recurrenceSensitiveIVs, bestSlice)) {
+          LDBG() << "Can't fuse: selected slice does not preserve "
+                    "loop-carried dependences";
+          continue;
+        }
 
         // Determine if 'srcId' can be removed after fusion, taking into
         // account remaining dependences, escaping memrefs and the fusion
@@ -1074,6 +1357,10 @@ public:
         bool removeSrcNode = canRemoveSrcNodeAfterFusion(
             srcId, dstId, bestSlice, fusedLoopInsPoint, srcEscapingMemRefs,
             *mdg);
+        if (!recurrenceSensitiveIVs.empty() && !removeSrcNode) {
+          LDBG() << "Can't fuse: source dependence would be duplicated";
+          continue;
+        }
 
         DenseSet<Value> privateMemrefs;
         for (Value memref : producerConsumerMemrefs) {
